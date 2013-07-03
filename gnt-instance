@@ -1,0 +1,359 @@
+#!/usr/bin/env python
+
+# -*- coding: utf-8 -*-
+
+DOCUMENTATION = '''
+---
+module: gnt-instance
+author: Fabien Dupont
+short_description: "Manage ganeti instances"
+requirements: []
+description:
+- Manage ganeti instances
+options:
+    name:
+        required: true
+        aliases: ["instance_name"]
+        description:
+        - Name of the instance being managed
+    state:
+        required: false
+        default: "present"
+        choices: ["present", "absent", "restarted", "started", "stopped", "migrated", "reinstalled"]
+        description:
+        - State of the instance. When C(absent), removes the instance.
+    cluster:
+        required: false
+        default: "localhost"
+        description:
+        - Domain name or IP address of the cluster.
+    port:
+        required: false
+        default: 5800
+        description:
+        - TCP port of the cluster's RAPI.
+    user:
+        required: false
+        description:
+        - User used to access the API (Must have write access).
+    password:
+        required: false
+        description:
+        - Password of the user used to access the API.
+    memory:
+        required: false
+        default: 256
+        description:
+        - Amount of memory awarded to the created instance
+          when state=present.
+    vcpus:
+        required: false
+        default: 1
+        description:
+        - Amount of vcpus awarded to the created instance
+          when state=present.
+    disk:
+        required: false
+        default: "2G"
+        description:
+        - Amount of disk space awarded to the created instance
+          when state=present. Accept a value in MB or a shortcut
+          like M, G, or T.
+    disk_template:
+        required: false
+        default: "drbd"
+        choices: ["sharedfile", "diskless", "plain", "blockdev", "drbd", "file", "rbd"]
+        description:
+        - Disk template used to create the instance's disk
+          when state=present.
+    iallocator:
+        required: false
+        default: "hail"
+        description:
+        - Plug'in used to select the instance's nodes when
+          state=present.
+    os_type:
+        required: false
+        default: "debootstrap+default"
+        description:
+        - Operating system installed on the instance when
+          state=present.
+    pnode:
+        required: false
+        description:
+        - Primary node where the instance is executed.
+    snode:
+        required: false
+        description:
+        - Secondary node where the instance is executed.
+          Required if disk_template = drbd.
+'''
+
+EXAMPLES = '''
+# Shutdown the instance 'foo'
+- gnt-instance: name=foo state=stopped
+
+# Create or modify an instance named 'bar' with 512MB of RAM and 2 CPUs
+- gnt-instance: name=bar memory=512 vcpus=2 state=present
+
+# Restart the instance 'baz'
+- gnt-instance: name=baz stated=restarted
+'''
+
+import os
+import syslog
+import platform
+import urllib2
+import urllib
+import base64
+import simplejson
+import time
+
+class MyRequest(urllib2.Request):
+    GET = 'get'
+    POST = 'post'
+    PUT = 'put'
+    DELETE = 'delete'
+
+    def __init__(self, url, data=None, headers={},
+                 origin_req_host=None, unverifiable=False, method=None):
+       urllib2.Request.__init__(self, url, data, headers, origin_req_host, unverifiable)
+       self.method = method
+
+    def get_method(self):
+        if self.method:
+            return self.method
+
+        return urllib2.Request.get_method(self)
+
+class Instance(object):
+    current = {}
+
+    def __new__(cls, *args, **kwargs):
+        return load_platform_subclass(Instance, args, kwargs)
+
+    def __init__(self, module):
+        self.module = module
+        self.changed = False
+        self.cluster = module.params["cluster"]
+        self.port = module.params["port"]
+        self.state = module.params["state"]
+        self.name = module.params["name"]
+        self.user = module.params["user"]
+        self.password = module.params["password"]
+        self.memory = module.params["memory"]
+        self.vcpus = module.params["vcpus"]
+        self.disk = module.params["disk"]
+        self.disk_template = module.params["disk_template"]
+        self.iallocator = module.params["iallocator"]
+        self.os_type = module.params["os_type"]
+        self.pnode = module.params["pnode"]
+        self.snode = module.params["snode"]
+
+    def query_api(self, method = 'get', **kwargs):
+        params = {}
+        url = 'https://' + self.cluster + ':' + str(self.port) + '/2'
+
+        if not('resource' in kwargs):
+            url = url + '/instances'
+        else:
+            url = url + kwargs['resource']
+
+        if 'params' in kwargs:
+            params = kwargs['params']
+
+        if self.module.check_mode and method != 'get':
+            return {'code': 200}
+
+        opener = urllib2.build_opener(urllib2.HTTPHandler)
+        request = MyRequest(url, data=simplejson.dumps(params), headers={'Content-Type': 'application/json'}, method=method)
+
+        if self.user != '' and self.password != '':
+            base64string = base64.encodestring('%s:%s' % (self.user, self.password)).replace('\n', '')
+            request.add_header("Authorization", "Basic %s" % base64string)   
+
+        try:
+            ret = opener.open(request)
+            return simplejson.load(ret)
+        except urllib2.URLError as e:
+            if method != 'get':
+                self.module.fail_json(name=self.name, msg='(' + method + ') ' + url + ': ' + simplejson.load(e)['explain'], params=params, code=e.code)
+            return e.code
+
+    def populate(self):
+        ret = self.query_api('get', resource = '/instances/' + self.name)
+        if ret == 404:
+            self.current = {'code': 404, 'msg': 'Not found'}
+        else:
+            self.current = ret
+            self.current['code'] = 200
+
+    def startup(self):
+        self.changed = True
+        return self.query_api('put', resource = '/instances/' + self.name + '/startup')
+
+    def reboot(self):
+        self.changed = True
+        return self.query_api('post', resource = '/instances/' + self.name + '/reboot')
+
+    def migrate(self):
+        self.changed = True
+        return self.query_api('put', resource = '/instances/' + self.name + '/migrate', params = {'allow_failover': True})
+
+    def reinstall(self):
+        self.changed = True
+        return self.query_api('post', resource = '/instances/' + self.name + '/reinstall')
+
+    def shutdown(self):
+        self.changed = True
+        return self.query_api('put', resource = '/instances/' + self.name + '/shutdown')
+
+    def delete(self):
+        self.changed = True
+        return self.query_api('delete', resource = '/instances/' + self.name)
+
+    def create(self):
+        self.changed = True
+        return self.query_api('post', resource = '/instances', params = {
+            '__version__': 1,
+            'beparams': {
+                'memory': self.memory,
+                'vcpus': self.vcpus
+            },
+            'disk_template': self.disk_template,
+            'disks': [{'size': self.disk}],
+            'iallocator': self.iallocator,
+            'instance_name': self.name,
+            'mode': 'create',
+            'pnode': None if self.pnode == '' else self.pnode,
+            'snode': None if self.snode == '' else self.snode,
+            'nics': [{}],
+            'os_type': self.os_type if self.os_type != None else 'debootstrap+default'
+        })
+
+    def modify(self, new_params):
+        self.changed = True
+        return self.query_api('put', resource = '/instances/' + self.name + '/modify', params = new_params)
+
+    def wait_for(self, job_id):
+        if self.module.check_mode:
+            return
+
+        status = 'unk'
+        while status != 'success' and status != 'error' and status != 'cancelled':
+            status = self.query_api('get', resource = '/jobs/' + job_id)['status']
+            time.sleep(1)
+
+        if status != 'success':
+            module.fail_json(name=instance.name, msg=job_id + ' ' + status)
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec = dict(
+            cluster=dict(default='localhost', type='str', required=False),
+            port=dict(default='5080', type='int', required=False),
+            state=dict(default='present', choices=['present', 'absent', 'restarted', 'started', 'stopped', 'migrated', 'reinstalled'], type='str'),
+            name=dict(required=True, type='str', aliases=['instance_name']),
+            user=dict(required=False, type='str', default=''),
+            password=dict(required=False, type='str', default=''),
+            memory=dict(type='int'),
+            vcpus=dict(type='int'),
+            disk=dict(type='str', default='2G'),
+            disk_template=dict(type='str', default='drbd', choices=['sharedfile', 'diskless', 'plain', 'blockdev', 'drbd', 'file', 'rbd']),
+            iallocator=dict(type='str', default='hail'),
+            os_type=dict(type='str'),
+            pnode=dict(type='str', default=''),
+            snode=dict(type='str', default=''),
+        ),
+        supports_check_mode=True
+    )
+
+    instance = Instance(module)
+    instance.populate()
+    last_job = None
+
+    if instance.current["code"] != 404 and instance.state != 'absent':
+        new_params = {}
+        changed = False
+        need_reinstall = False
+        need_shutdown = False
+
+        if instance.memory and instance.current['beparams']['memory'] != instance.memory:
+            try:
+                new_params['beparams']
+            except:
+                new_params['beparams'] = {}
+            new_params['beparams']['memory'] = instance.memory
+            changed = True
+
+        if instance.vcpus and instance.current['beparams']['vcpus'] != instance.vcpus:
+            try:
+                new_params['beparams']
+            except:
+                new_params['beparams'] = {}
+            new_params['beparams']['vcpus'] = instance.vcpus
+            changed = True
+
+        if instance.disk_template and instance.current['disk_template'] != instance.disk_template:
+            new_params['disk_template'] = instance.disk_template
+            if instance.disk_template == 'drbd':
+                if instance.snode == '':
+                    module.fail_json(msg='No secondary node specified')
+                new_params['remote_node'] = instance.snode
+            changed = True
+            need_shutdown = True
+
+        if instance.os_type and instance.current['os'] != instance.os_type:
+            new_params['os_name'] = instance.os_type
+            changed = True
+            need_reinstall = True
+
+        if need_shutdown:
+            instance.wait_for(instance.shutdown())
+
+        if changed:
+            instance.wait_for(instance.modify(new_params))
+
+        if need_reinstall:
+            instance.reinstall()
+
+        elif need_shutdown:
+            instance.wait_for(instance.startup())
+
+    if instance.current["code"] == 404 and instance.state != 'absent' and instance.state != 'present':
+        module.fail_json(name=instance.name, msg=instance.current["msg"])
+
+    elif instance.state == 'stopped':
+        if instance.current['status'] == 'running':
+            instance.shutdown()
+
+    elif instance.state == 'started':
+        if instance.current['status'] != 'running':
+            instance.startup()
+
+    elif instance.state == 'restarted':
+        if instance.current['status'] == 'running':
+            instance.reboot()
+        elif instance.current['status'] == 'ADMIN_down':
+            instance.startup()
+
+    elif instance.state == 'migrated':
+        instance.migrate()
+
+    elif instance.state == 'reinstalled':
+        instance.reinstall()
+
+    elif instance.state == 'absent':
+        if instance.current['code'] != 404:
+            instance.delete()
+        
+    elif instance.state == 'present':
+        if instance.current['code'] == 404:
+            instance.create()
+
+    module.exit_json(changed=instance.changed, name=instance.name, state=instance.state)
+
+# include magic from lib/ansible/module_common.py
+#<<INCLUDE_ANSIBLE_MODULE_COMMON>>
+main()
