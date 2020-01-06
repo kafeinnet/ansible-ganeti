@@ -1,6 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 
-# -*- coding: utf-8 -*-
+ANSIBLE_METADATA = {
+    'metadata_version': '1.1',
+    'status': ['preview'],
+    'supported_by': 'community',
+}
 
 DOCUMENTATION = '''
 ---
@@ -91,25 +95,37 @@ options:
 
 EXAMPLES = '''
 # Shutdown the instance 'foo'
-- gnt-instance: name=foo state=stopped
+- gnt-instance:
+      name: foo
+      state: stopped
 
 # Create or modify an instance named 'bar' with 512MB of RAM and 2 CPUs
-- gnt-instance: name=bar memory=512 vcpus=2 state=present
+- gnt-instance:
+      name: bar
+      memory: 512
+      vcpus: 2
+      state: present
 
 # Restart the instance 'baz'
-- gnt-instance: name=baz stated=restarted
+- gnt-instance:
+      name: baz
+      stated: restarted
 '''
 
-import os
-import syslog
-import platform
-import urllib2
-import urllib
 import base64
-import simplejson
+import json
 import time
+from ansible.module_utils.basic import AnsibleModule, load_platform_subclass
+from ansible.module_utils._text import to_bytes, to_text
 
-class MyRequest(urllib2.Request):
+try:
+    from urllib2 import Request, build_opener, HTTPSHandler
+except ImportError:
+    from urllib.request import Request, build_opener, HTTPSHandler
+    from urllib.error import URLError
+
+
+class MyRequest(Request):
     GET = 'get'
     POST = 'post'
     PUT = 'put'
@@ -117,14 +133,15 @@ class MyRequest(urllib2.Request):
 
     def __init__(self, url, data=None, headers={},
                  origin_req_host=None, unverifiable=False, method=None):
-       urllib2.Request.__init__(self, url, data, headers, origin_req_host, unverifiable)
-       self.method = method
+        Request.__init__(self, url, data, headers, origin_req_host, unverifiable)
+        self.method = method
 
     def get_method(self):
         if self.method:
             return self.method
 
-        return urllib2.Request.get_method(self)
+        return Request.get_method(self)
+
 
 class Instance(object):
     current = {}
@@ -150,7 +167,7 @@ class Instance(object):
         self.pnode = module.params["pnode"]
         self.snode = module.params["snode"]
 
-    def query_api(self, method = 'get', **kwargs):
+    def query_api(self, method='get', **kwargs):
         params = {}
         url = 'https://' + self.cluster + ':' + str(self.port) + '/2'
 
@@ -165,23 +182,23 @@ class Instance(object):
         if self.module.check_mode and method != 'get':
             return {'code': 200}
 
-        opener = urllib2.build_opener(urllib2.HTTPHandler)
-        request = MyRequest(url, data=simplejson.dumps(params), headers={'Content-Type': 'application/json'}, method=method)
+        opener = build_opener(HTTPSHandler())
+        request = MyRequest(url, data=to_bytes(json.dumps(params)), headers={'Content-Type': 'application/json'}, method=method)
 
         if self.user != '' and self.password != '':
-            base64string = base64.encodestring('%s:%s' % (self.user, self.password)).replace('\n', '')
-            request.add_header("Authorization", "Basic %s" % base64string)   
+            base64string = base64.b64encode(to_bytes('%s:%s' % (self.user, self.password)))
+            request.add_header("Authorization", "Basic %s" % to_text(base64string))
 
         try:
             ret = opener.open(request)
-            return simplejson.load(ret)
-        except urllib2.URLError as e:
+            return json.load(ret)
+        except URLError as e:
             if method != 'get':
-                self.module.fail_json(name=self.name, msg='(' + method + ') ' + url + ': ' + simplejson.load(e)['explain'], params=params, code=e.code)
+                self.module.fail_json(name=self.name, msg='(' + method + ') ' + url + ': ' + json.load(e)['explain'], params=params, code=e.code)
             return e.code
 
     def populate(self):
-        ret = self.query_api('get', resource = '/instances/' + self.name)
+        ret = self.query_api('get', resource='/instances/' + self.name)
         if ret == 404:
             self.current = {'code': 404, 'msg': 'Not found'}
         else:
@@ -190,31 +207,31 @@ class Instance(object):
 
     def startup(self):
         self.changed = True
-        return self.query_api('put', resource = '/instances/' + self.name + '/startup')
+        return self.query_api('put', resource='/instances/' + self.name + '/startup')
 
     def reboot(self):
         self.changed = True
-        return self.query_api('post', resource = '/instances/' + self.name + '/reboot')
+        return self.query_api('post', resource='/instances/' + self.name + '/reboot')
 
     def migrate(self):
         self.changed = True
-        return self.query_api('put', resource = '/instances/' + self.name + '/migrate', params = {'allow_failover': True})
+        return self.query_api('put', resource='/instances/' + self.name + '/migrate', params={'allow_failover': True})
 
     def reinstall(self):
         self.changed = True
-        return self.query_api('post', resource = '/instances/' + self.name + '/reinstall')
+        return self.query_api('post', resource='/instances/' + self.name + '/reinstall')
 
     def shutdown(self):
         self.changed = True
-        return self.query_api('put', resource = '/instances/' + self.name + '/shutdown')
+        return self.query_api('put', resource='/instances/' + self.name + '/shutdown')
 
     def delete(self):
         self.changed = True
-        return self.query_api('delete', resource = '/instances/' + self.name)
+        return self.query_api('delete', resource='/instances/' + self.name)
 
     def create(self):
         self.changed = True
-        return self.query_api('post', resource = '/instances', params = {
+        return self.query_api('post', resource='/instances', params={
             '__version__': 1,
             'beparams': {
                 'memory': self.memory,
@@ -233,7 +250,7 @@ class Instance(object):
 
     def modify(self, new_params):
         self.changed = True
-        return self.query_api('put', resource = '/instances/' + self.name + '/modify', params = new_params)
+        return self.query_api('put', resource='/instances/' + self.name + '/modify', params=new_params)
 
     def wait_for(self, job_id):
         if self.module.check_mode:
@@ -241,22 +258,22 @@ class Instance(object):
 
         status = 'unk'
         while status != 'success' and status != 'error' and status != 'cancelled':
-            status = self.query_api('get', resource = '/jobs/' + job_id)['status']
+            status = self.query_api('get', resource='/jobs/' + job_id)['status']
             time.sleep(1)
 
         if status != 'success':
-            module.fail_json(name=instance.name, msg=job_id + ' ' + status)
+            self.module.fail_json(name=instance.name, msg=job_id + ' ' + status)
 
 
 def main():
     module = AnsibleModule(
-        argument_spec = dict(
+        argument_spec=dict(
             cluster=dict(default='localhost', type='str', required=False),
             port=dict(default='5080', type='int', required=False),
             state=dict(default='present', choices=['present', 'absent', 'restarted', 'started', 'stopped', 'migrated', 'reinstalled'], type='str'),
             name=dict(required=True, type='str', aliases=['instance_name']),
             user=dict(required=False, type='str', default=''),
-            password=dict(required=False, type='str', default=''),
+            password=dict(required=False, type='str', default='', no_log=True),
             memory=dict(type='int'),
             vcpus=dict(type='int'),
             disk=dict(type='str', default='2G'),
@@ -282,7 +299,7 @@ def main():
         if instance.memory and instance.current['beparams']['memory'] != instance.memory:
             try:
                 new_params['beparams']
-            except:
+            except Exception:
                 new_params['beparams'] = {}
             new_params['beparams']['memory'] = instance.memory
             changed = True
@@ -290,7 +307,7 @@ def main():
         if instance.vcpus and instance.current['beparams']['vcpus'] != instance.vcpus:
             try:
                 new_params['beparams']
-            except:
+            except Exception:
                 new_params['beparams'] = {}
             new_params['beparams']['vcpus'] = instance.vcpus
             changed = True
@@ -347,13 +364,13 @@ def main():
     elif instance.state == 'absent':
         if instance.current['code'] != 404:
             instance.delete()
-        
+
     elif instance.state == 'present':
         if instance.current['code'] == 404:
             instance.create()
 
     module.exit_json(changed=instance.changed, name=instance.name, state=instance.state)
 
-# include magic from lib/ansible/module_common.py
-#<<INCLUDE_ANSIBLE_MODULE_COMMON>>
-main()
+
+if __name__ == '__main__':
+    main()
